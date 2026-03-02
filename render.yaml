@@ -1,0 +1,44 @@
+# ==========================================
+# RENDER.COM INFRASTRUCTURE DEPLOYMENT FILE
+# ==========================================
+# This file automates the build and run commands for your FastAPI backend.
+
+services:
+  - type: web
+    name: cyber-odyssey-backend
+    env: python
+    # Select the region closest to your primary user base in India for optimal latency
+    region: singapore 
+    
+    # buildCommand installs the locked-in dependencies from our requirements.txt
+    buildCommand: "pip install -r requirements.txt"
+    
+    # startCommand launches the Uvicorn ASGI server. 
+    # 'app.main:app' targets the FastAPI instance named 'app' inside 'app/main.py'.
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    
+    envVars:
+      # Enforce a specific Python version to match local testing
+      - key: PYTHON_VERSION
+        value: 3.11.0
+        
+      # Non-sensitive configuration variables
+      - key: SMTP_SERVER
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: 587
+      - key: SENDER_EMAIL
+        value: your-event-email@gmail.com
+      
+      # ==========================================
+      # CRITICAL SECURITY OVERRIDES
+      # ==========================================
+      # setting 'sync: false' means Render will NOT read the values from this file.
+      # You MUST manually enter the actual password and Firebase JSON string 
+      # directly in the Render Web Dashboard (Environment -> Environment Variables) 
+      # after you connect your repository.
+      
+      - key: SENDER_PASSWORD
+        sync: false 
+      - key: FIREBASE_SERVICE_ACCOUNT_KEY
+        sync: false
