@@ -11,7 +11,7 @@ pydantic-settings==2.2.1
 
 # QR Code Generation & Image Processing
 qrcode[pil]==7.4.2
-Pillow==10.3.0
+Pillow
 
 # Note: The standard 'email' and 'smtplib' libraries used in 
 # email_service.py are built directly into Python, so they 
