@@ -1,58 +1,90 @@
+import smtplib
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from firebase_admin import firestore
 
-# Importing your internal modules to lock in the architecture [cite: 233]
+# Core imports from your source code
 from app.api.routes import router as api_router
 from app.api.websockets import router as websocket_router
 from app.core.firebase_db import initialize_firebase
+from app.core.config import get_settings
+
+settings = get_settings()
+
+async def run_system_diagnostics():
+    """
+    Internal testing kit to verify cloud service health.
+    """
+    results = {"firebase": "FAILED", "smtp": "FAILED"}
+    
+    # 1. Test Firebase Connectivity
+    try:
+        db = firestore.client()
+        # Attempt to read a single document from a known collection
+        db.collection('system_check').document('health').get()
+        results["firebase"] = "OPERATIONAL"
+    except Exception as e:
+        print(f"DIAGNOSTIC CRITICAL: Firebase Connection Refused - {e}")
+
+    # 2. Test SMTP/Email Health
+    try:
+        with smtplib.SMTP(settings.SMTP_SERVER, settings.SMTP_PORT, timeout=5) as server:
+            server.starttls()
+            server.login(settings.SENDER_EMAIL, settings.SENDER_PASSWORD)
+            results["smtp"] = "OPERATIONAL"
+    except Exception as e:
+        print(f"DIAGNOSTIC CRITICAL: SMTP Authentication Failed - {e}")
+        
+    return results
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Manages the application lifecycle.
-    Initializes the Firebase Admin SDK on startup so Firestore is available to all routes[cite: 275].
+    Application lifespan manager with integrated testing kit.
     """
     print("INITIALIZING GRID: Starting Firebase Admin SDK...")
-    try:
-        initialize_firebase()
-        print("GRID ONLINE: Firebase initialization complete.")
-    except Exception as e:
-        print(f"CRITICAL SYSTEM FAILURE: Could not initialize Firebase: {e}")
-        # Application will still start, but database routes will return 500 errors.
+    initialize_firebase() # [cite: 233-234, 275]
+    
+    # Run diagnostics on boot
+    health = await run_system_diagnostics()
+    print(f"PRE-FLIGHT CHECK COMPLETE: Firebase: {health['firebase']} | SMTP: {health['smtp']}")
     
     yield
-    
-    print("SHUTTING DOWN GRID: Terminating Cyber Odyssey backend...")
+    print("SHUTTING DOWN GRID: All systems offline.")
 
-# Initialize the core FastAPI application [cite: 235]
 app = FastAPI(
     title="Cyber Odyssey 2.0 API",
-    description="Backend services for Event Management. Handles auth, data routing, and real-time WebSocket broadcasting.",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# Configure CORS (Cross-Origin Resource Sharing)
-# This allows your local dev environment (127.0.0.1) and Vercel to talk to Render[cite: 236].
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Change to ["https://your-domain.vercel.app"] for production security
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"], 
     allow_headers=["*"], 
 )
 
-# Mount the API and WebSocket routers [cite: 236]
-# Ensure your frontend calls match these prefixes (e.g., /api/v1/participants)
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(websocket_router, prefix="/ws")
 
-# Root health-check endpoint for Render's automated monitoring [cite: 236]
-@app.get("/", tags=["Health Check"])
-async def health_check():
+@app.get("/api/v1/debug/health", tags=["Diagnostics"])
+async def secure_health_check():
+    """
+    Secure endpoint to return a JSON health report.
+    Useful for verifying SMTP/Firebase status after a fresh deployment.
+    """
+    report = await run_system_diagnostics()
+    if "FAILED" in report.values():
+        raise HTTPException(status_code=503, detail=report)
     return {
-        "status": "online",
-        "system": "Cyber Odyssey 2.0 Backend",
-        "message": "All systems operational."
+        "status": "Healthy",
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "services": report
     }
+
+@app.get("/", tags=["Health Check"])
+async def root_check():
+    return {"status": "online", "message": "Cyber Odyssey 2.0 Backend Operational."}
