@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, status, Depends
-from firebase_admin import firestore
+from firebase_admin import firestore, auth
 import uuid
 from datetime import datetime, timezone
 from typing import List, Dict, Any
@@ -13,7 +13,8 @@ from app.models.schemas import (
     ParticipantResponse,
     CommsPayloadSchema,
     EvaluationPayloadSchema,
-    BracketUpdateSchema
+    BracketUpdateSchema,
+    VolunteerCreateSchema
 )
 from app.services.email_service import send_qr_email
 from app.services.bracket_algo import generate_perfect_bracket
@@ -250,5 +251,33 @@ async def update_bracket_node(event_id: str, payload: BracketUpdateSchema, db: f
 
         bracket_ref.update({"rounds": rounds})
         return {"message": "Node successfully locked."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# 12. AUTHORIZE VOLUNTEER (Fixes Admin Dashboard 404)
+# ---------------------------------------------------------
+@router.post("/admin/volunteers")
+async def register_volunteer(data: VolunteerCreateSchema, db: firestore.Client = Depends(get_db)):
+    try:
+        # 1. Create the user directly in Firebase Authentication via Admin SDK
+        # This prevents the Admin's frontend session from being hijacked
+        user_record = auth.create_user(
+            email=data.email,
+            password=data.password
+        )
+        
+        # 2. Create the user's role profile in Firestore
+        db.collection('users').document(user_record.uid).set({
+            "email": data.email,
+            "role": "Volunteer",
+            "assigned_event": data.assigned_event,
+            "created_at": datetime.now(timezone.utc)
+        })
+        
+        return {"message": f"Volunteer {data.email} authorized successfully.", "status": "success"}
+        
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail="This email is already authorized in the grid.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

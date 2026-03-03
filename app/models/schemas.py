@@ -68,3 +68,9 @@ class BracketUpdateSchema(BaseModel):
     round_index: int
     match_index: int
     winner_id: str
+
+# 8. Volunteer Authorization Schema
+class VolunteerCreateSchema(BaseModel):
+    email: EmailStr
+    password: str
+    assigned_event: str
