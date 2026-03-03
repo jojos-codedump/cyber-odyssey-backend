@@ -76,6 +76,19 @@ async def create_team(team_data: TeamCreateSchema, db: firestore.Client = Depend
     team_ref.set(new_team)
     return new_team
 
+@router.get("/admin/events/{event_id}/roster", status_code=status.HTTP_200_OK)
+async def get_event_roster(event_id: str, db: firestore.Client = Depends(get_db)):
+    """
+    Fetches the confirmed participant list for the Admin Roster Modal.
+    Fixes the 'API Error' currently seen in the frontend.
+    """
+    try:
+        # Queries Firestore for all participants confirmed for this specific event
+        participants_ref = db.collection('participants').where('event_id', '==', event_id).where('status', '==', 'Confirmed')
+        docs = participants_ref.stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 # ---------------------------------------------------------
 # 3. PARTICIPANT REGISTRATION & WAITLIST LOGIC
 # ---------------------------------------------------------
