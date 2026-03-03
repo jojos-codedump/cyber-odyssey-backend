@@ -44,6 +44,26 @@ class ParticipantResponse(BaseModel):
     status: str
     registered_at: datetime
 
+# ---------------------------------------------------------
+# NEW: PHASE 3 - VOLUNTEER CRUD UPDATE SCHEMA
+# ---------------------------------------------------------
+class ParticipantUpdateSchema(BaseModel):
+    """
+    All fields are Optional. This allows the frontend to send a PATCH request
+    modifying only specific fields (like changing a team_id or fixing a typo)
+    without needing to resubmit the participant's entire profile.
+    """
+    event_id: Optional[str] = None
+    full_name: Optional[str] = None
+    enrollment_number: Optional[str] = None
+    is_external: Optional[bool] = None
+    university_name: Optional[str] = None
+    department: Optional[str] = None
+    academic_year: Optional[str] = None
+    contact_number: Optional[str] = None
+    gmail: Optional[EmailStr] = None
+    team_id: Optional[str] = None
+
 # 4. QR & Attendance
 class QRScanSchema(BaseModel):
     event_id: str
