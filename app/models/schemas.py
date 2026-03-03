@@ -1,5 +1,5 @@
-from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List, Dict
+from pydantic import BaseModel, EmailStr
+from typing import Optional, Dict
 from datetime import datetime
 
 # 1. User Sync Schema (Fixes Database Error during login/sync)
@@ -48,4 +48,23 @@ class ParticipantResponse(BaseModel):
 class QRScanSchema(BaseModel):
     event_id: str
     participant_id: str
-    scanned_by_uid: str
+    scanned_by_uid: str 
+
+# 5. Communications Dispatch
+class CommsPayloadSchema(BaseModel):
+    target_event: str
+    subject: str
+    body: str
+
+# 6. Judge Evaluations
+class EvaluationPayloadSchema(BaseModel):
+    target_id: str
+    scores: Dict[str, int]
+    feedback: Optional[str] = ""
+    event_id: str
+
+# 7. Tournament Bracket Updates
+class BracketUpdateSchema(BaseModel):
+    round_index: int
+    match_index: int
+    winner_id: str
