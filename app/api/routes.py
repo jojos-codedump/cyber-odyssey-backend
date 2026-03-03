@@ -15,7 +15,7 @@ from app.models.schemas import (
     EvaluationPayloadSchema,
     BracketUpdateSchema,
     VolunteerCreateSchema,
-    ParticipantUpdateSchema # <--- Phase 3 Import Added Here
+    ParticipantUpdateSchema 
 )
 from app.services.email_service import send_qr_email
 from app.services.bracket_algo import generate_perfect_bracket
@@ -154,8 +154,6 @@ async def log_attendance_scan(scan_data: QRScanSchema, db: firestore.Client = De
             "scanned_by": scan_data.scanned_by_uid
         })
 
-        # TODO: Trigger WebSocket to update Admin Dashboard live count here
-
         return {"message": "Check-in successful.", "status": "success"}
 
     except HTTPException:
@@ -193,8 +191,6 @@ async def get_event_roster(event_id: str, db: firestore.Client = Depends(get_db)
 @router.post("/admin/comms/dispatch")
 async def dispatch_communications(payload: CommsPayloadSchema, db: firestore.Client = Depends(get_db)):
     try:
-        # Note: In a real environment, this would loop through participants and send emails
-        # For now, it logs the intent to the database for tracking.
         db.collection('communications_log').add({
             "target_event": payload.target_event,
             "subject": payload.subject,
@@ -211,11 +207,10 @@ async def dispatch_communications(payload: CommsPayloadSchema, db: firestore.Cli
 @router.post("/evaluations/submit")
 async def submit_evaluation(payload: EvaluationPayloadSchema, db: firestore.Client = Depends(get_db)):
     try:
-        # Calculate Total Score
         total_score = sum(payload.scores.values())
 
         eval_data = {
-            "target_id": payload.target_id,  # Can be a team_id or participant_id
+            "target_id": payload.target_id, 
             "event_id": payload.event_id,
             "scores": payload.scores,
             "total_score": total_score,
@@ -234,7 +229,6 @@ async def submit_evaluation(payload: EvaluationPayloadSchema, db: firestore.Clie
 @router.post("/events/bracket/{event_id}/generate")
 async def initialize_bracket(event_id: str, db: firestore.Client = Depends(get_db)):
     try:
-        # 1. Fetch all checked-in teams/participants for this event
         participants_ref = db.collection('participants').where('event_id', '==', event_id).where('attendance_status', '==', 'Present')
         docs = participants_ref.stream()
         
@@ -243,10 +237,8 @@ async def initialize_bracket(event_id: str, db: firestore.Client = Depends(get_d
         if len(competitors) < 2:
              raise HTTPException(status_code=400, detail="Not enough checked-in participants to generate a bracket.")
 
-        # 2. Run the algorithmic generation
         bracket_structure = generate_perfect_bracket(competitors)
         
-        # 3. Save to database
         db.collection('event_settings').document(f"{event_id}_bracket").set({
             "rounds": bracket_structure,
             "generated_at": datetime.now(timezone.utc),
@@ -273,7 +265,6 @@ async def update_bracket(event_id: str, payload: BracketUpdateSchema, db: firest
         bracket_data = doc.to_dict()
         rounds = bracket_data.get("rounds", [])
         
-        # Validate indices
         r_idx = payload.round_index
         m_idx = payload.match_index
         if r_idx >= len(rounds) - 1:
@@ -281,7 +272,6 @@ async def update_bracket(event_id: str, payload: BracketUpdateSchema, db: firest
             
         current_match = rounds[r_idx][m_idx]
         
-        # Identify the winner's data
         winner_node = None
         if current_match.get("p1") and current_match["p1"].get("id") == payload.winner_id:
             winner_node = current_match["p1"]
@@ -291,7 +281,6 @@ async def update_bracket(event_id: str, payload: BracketUpdateSchema, db: firest
         if not winner_node:
             raise HTTPException(status_code=400, detail="Winner ID not found in the specified match.")
 
-        # Advance to next round
         next_round_idx = r_idx + 1
         next_match_idx = m_idx // 2
         participant_slot = "p1" if m_idx % 2 == 0 else "p2"
@@ -304,19 +293,16 @@ async def update_bracket(event_id: str, payload: BracketUpdateSchema, db: firest
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------
-# 12. AUTHORIZE VOLUNTEER (Fixes Admin Dashboard 404)
+# 12. AUTHORIZE VOLUNTEER
 # ---------------------------------------------------------
 @router.post("/admin/volunteers")
 async def register_volunteer(data: VolunteerCreateSchema, db: firestore.Client = Depends(get_db)):
     try:
-        # 1. Create the user directly in Firebase Authentication via Admin SDK
-        # This prevents the Admin's frontend session from being hijacked
         user_record = auth.create_user(
             email=data.email,
             password=data.password
         )
         
-        # 2. Create the user's role profile in Firestore
         db.collection('users').document(user_record.uid).set({
             "email": data.email,
             "role": "Volunteer",
@@ -331,18 +317,12 @@ async def register_volunteer(data: VolunteerCreateSchema, db: firestore.Client =
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# =========================================================
-# NEW PHASE 3: VOLUNTEER CRUD OPERATIONS
-# =========================================================
-
 # ---------------------------------------------------------
 # 13. UPDATE PARTICIPANT DATA (PATCH)
 # ---------------------------------------------------------
 @router.patch("/admin/participants/{participant_id}")
 async def update_participant(participant_id: str, data: ParticipantUpdateSchema, db: firestore.Client = Depends(get_db)):
     try:
-        # exclude_none=True ensures we only pull fields the frontend actually sent
         update_data = data.dict(exclude_none=True)
         
         if not update_data:
@@ -378,23 +358,51 @@ async def delete_participant(participant_id: str, db: firestore.Client = Depends
         participant_data = doc.to_dict()
         gmail = participant_data.get("gmail")
         
-        # 1. Eradicate from Firestore
         doc_ref.delete()
         
-        # 2. Deep Eradication: Attempt to delete Firebase Auth user to fully revoke access
         if gmail:
             try:
                 user_record = auth.get_user_by_email(gmail)
                 auth.delete_user(user_record.uid)
-                # Also clean up their role profile
                 db.collection('users').document(user_record.uid).delete()
             except Exception:
-                # Silently catch auth deletion errors (e.g., if the user hasn't created a password yet)
                 pass
                 
         return {"message": "Node access permanently revoked.", "status": "success"}
         
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =========================================================
+# NEW PHASE 4: ADMIN STAFF MANAGEMENT
+# =========================================================
+
+# ---------------------------------------------------------
+# 15. FETCH ACTIVE STAFF (ADMIN DASHBOARD)
+# ---------------------------------------------------------
+@router.get("/admin/staff")
+async def get_active_staff(db: firestore.Client = Depends(get_db)):
+    try:
+        # Use a highly efficient 'in' query to pull only administrative accounts
+        query = db.collection('users').where('role', 'in', ['Admin', 'Volunteer'])
+        docs = query.stream()
+        
+        staff_list = []
+        for doc in docs:
+            data = doc.to_dict()
+            
+            # Construct a clean payload explicitly ignoring any sensitive auth data
+            staff_list.append({
+                "uid": doc.id,
+                "email": data.get("email", "Unknown"),
+                "role": data.get("role", "Unknown"),
+                "assigned_event": data.get("assigned_event", "Master Control"),
+                "last_active": data.get("synced_at") or data.get("created_at")
+            })
+            
+        return staff_list
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
