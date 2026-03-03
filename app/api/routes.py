@@ -148,10 +148,22 @@ async def log_attendance_scan(scan_data: QRScanSchema, db: firestore.Client = De
         if p_data.get('attendance_status') == "Present":
             return {"message": "Participant already checked in.", "status": "duplicate"}
 
+        scan_time = datetime.now(timezone.utc)
+
+        # 1. Update the participant node
         doc_ref.update({
             "attendance_status": "Present",
-            "scanned_at": datetime.now(timezone.utc),
+            "scanned_at": scan_time,
             "scanned_by": scan_data.scanned_by_uid
+        })
+
+        # 2. Push to the immutable Global Attendance Log
+        db.collection('attendance_logs').add({
+            "participant_id": scan_data.participant_id,
+            "participant_name": p_data.get("full_name", "Unknown Node"),
+            "event_id": scan_data.event_id,
+            "scanned_by_uid": scan_data.scanned_by_uid,
+            "timestamp": scan_time
         })
 
         return {"message": "Check-in successful.", "status": "success"}
@@ -385,15 +397,12 @@ async def delete_participant(participant_id: str, db: firestore.Client = Depends
 @router.get("/admin/staff")
 async def get_active_staff(db: firestore.Client = Depends(get_db)):
     try:
-        # Use a highly efficient 'in' query to pull only administrative accounts
         query = db.collection('users').where('role', 'in', ['Admin', 'Volunteer'])
         docs = query.stream()
         
         staff_list = []
         for doc in docs:
             data = doc.to_dict()
-            
-            # Construct a clean payload explicitly ignoring any sensitive auth data
             staff_list.append({
                 "uid": doc.id,
                 "email": data.get("email", "Unknown"),
@@ -403,6 +412,34 @@ async def get_active_staff(db: firestore.Client = Depends(get_db)):
             })
             
         return staff_list
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =========================================================
+# NEW PHASE 5: REAL-TIME GLOBAL ATTENDANCE LOGS
+# =========================================================
+
+# ---------------------------------------------------------
+# 16. FETCH GLOBAL ATTENDANCE LOGS
+# ---------------------------------------------------------
+@router.get("/admin/attendance/logs")
+async def get_attendance_logs(db: firestore.Client = Depends(get_db)):
+    try:
+        # Query the logs collection, order by newest first, limit to 200
+        query = db.collection('attendance_logs').order_by(
+            'timestamp', direction=firestore.Query.DESCENDING
+        ).limit(200)
+        
+        docs = query.stream()
+        
+        logs = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['log_id'] = doc.id
+            logs.append(data)
+            
+        return logs
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
