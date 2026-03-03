@@ -157,8 +157,8 @@ async def log_attendance_scan(scan_data: QRScanSchema, db: firestore.Client = De
             "scanned_by": scan_data.scanned_by_uid
         })
 
-        # 2. Push to the immutable Global Attendance Log
-        db.collection('attendance_logs').add({
+        # 2. Push to the immutable Global Attendance Log (Updated Collection Name)
+        db.collection('attendance').add({
             "participant_id": scan_data.participant_id,
             "participant_name": p_data.get("full_name", "Unknown Node"),
             "event_id": scan_data.event_id,
@@ -426,8 +426,8 @@ async def get_active_staff(db: firestore.Client = Depends(get_db)):
 @router.get("/admin/attendance/logs")
 async def get_attendance_logs(db: firestore.Client = Depends(get_db)):
     try:
-        # Query the logs collection, order by newest first, limit to 200
-        query = db.collection('attendance_logs').order_by(
+        # Query the logs collection, order by newest first, limit to 200 (Updated Collection Name)
+        query = db.collection('attendance').order_by(
             'timestamp', direction=firestore.Query.DESCENDING
         ).limit(200)
         
