@@ -13,7 +13,10 @@ pydantic-settings==2.2.1
 qrcode[pil]==7.4.2
 Pillow
 
-# Note: The standard 'email' and 'smtplib' libraries used in 
-# email_service.py are built directly into Python, so they 
-# do not need to be listed here.
+# Email — HTTP-based API (replaces SMTP which is blocked on Render free tier)
+# Render blocks outbound connections on port 587, causing "Network is unreachable".
+# Resend uses HTTPS (port 443) which is always open.
+resend==2.0.0
+
+# Input validation
 email-validator==2.1.1

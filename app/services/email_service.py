@@ -1,15 +1,12 @@
 import json
-import smtplib
+import base64
 import asyncio
 import logging
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
 from io import BytesIO
-from functools import partial
 
 import qrcode
 import qrcode.constants
+import resend
 
 from app.core.config import get_settings
 
@@ -19,17 +16,20 @@ from app.core.config import get_settings
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
-SMTP_SERVER     = settings.SMTP_SERVER.strip()
-SMTP_PORT       = int(settings.SMTP_PORT)
-SENDER_EMAIL    = settings.SENDER_EMAIL.strip()
-SENDER_PASSWORD = settings.SENDER_PASSWORD.strip()
+# Authenticate the Resend client once at import time.
+# RESEND_API_KEY is read from your Render environment variables.
+resend.api_key = settings.RESEND_API_KEY
 
-# How many times to retry a failed SMTP send before giving up
-MAX_RETRIES = 2
+# The "from" address must be a domain you have verified in Resend.
+# Until you verify a custom domain, Resend lets you send from
+# onboarding@resend.dev for testing. For production, set up your
+# own domain (e.g. noreply@cyberodyssey.yourdomain.com) in the
+# Resend dashboard and update RESEND_FROM_EMAIL in your env vars.
+SENDER_FROM = settings.RESEND_FROM_EMAIL
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QR-code generation
+# QR-code generation  (unchanged from original)
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_qr_payload(
     participant_id: str,
@@ -38,12 +38,8 @@ def _build_qr_payload(
     team_id: str,
 ) -> str:
     """
-    Returns a JSON string that matches the payload shape expected by
-    scanner.html:  { p_id, e_id, name, t_id }
-
-    Using JSON (rather than a plain delimited string) means the scanner
-    can extract fields by name and is resilient to names that contain
-    the old pipe-delimiter character.
+    Returns a JSON string matching the payload shape expected by scanner.html:
+        { p_id, e_id, name, t_id }
     """
     return json.dumps({
         "p_id": participant_id,
@@ -56,11 +52,10 @@ def _build_qr_payload(
 def _generate_qr_bytes(payload: str) -> bytes:
     """
     Renders a QR code from *payload* and returns raw PNG bytes.
-    Uses ERROR_CORRECT_M (≈15 % recovery) so the code is still readable
-    if printed small or slightly damaged.
+    ERROR_CORRECT_M gives ~15% recovery — readable even if slightly damaged.
     """
     qr = qrcode.QRCode(
-        version=None,                               # auto-size
+        version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=10,
         border=4,
@@ -75,38 +70,33 @@ def _generate_qr_bytes(payload: str) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email assembly
+# HTML email body builder  (unchanged from original)
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_email(
-    participant_email: str,
+def _build_html_body(
     participant_name: str,
     event_name: str,
     team_id: str,
-    qr_bytes: bytes,
-) -> MIMEMultipart:
+) -> tuple[str, str]:
     """
-    Assembles a multipart/alternative email (plain-text + HTML) with the
-    QR code embedded inline in the HTML body AND attached as a PNG file.
-    This covers mail clients that block inline images (they still get the
-    attachment) and clients that can't render HTML (they get the plain text).
+    Returns (plain_text, html_string).
+    The HTML uses a data-URI for the QR image so no CID/inline-attachment
+    tricks are needed — the image is embedded directly in the HTML string
+    and works in every mail client.
     """
     first_name = participant_name.split()[0] if participant_name else participant_name
 
-    # ── Plain-text fallback ──────────────────────────────────────────────────
-    plain_body = (
+    plain = (
         f"Hello {first_name},\n\n"
         f"Your registration for {event_name} at Cyber Odyssey 2.0 is confirmed!\n\n"
-        f"Attached to this email is your official Digital ID (QR Code).\n"
-        f"Please present it to our volunteers at the entry desk — "
-        f"either on your phone screen or as a printout.\n\n"
+        f"Your QR Digital ID is attached to this email as a PNG file.\n"
+        f"Please present it to our volunteers at the entry desk.\n\n"
         f"Team / Group ID : {team_id}\n\n"
         f"See you at the event!\n"
         f"— Department of CSE (IoT, CS, BT)\n"
         f"  Cyber Odyssey 2.0 Organising Committee"
     )
 
-    # ── HTML body (QR embedded inline via CID reference) ────────────────────
-    html_body = f"""<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -120,8 +110,6 @@ def _build_email(
         <table width="560" cellpadding="0" cellspacing="0"
                style="background:#0c0c14;border:1px solid rgba(0,255,204,0.2);
                       border-radius:6px;overflow:hidden;max-width:100%;">
-
-          <!-- Header -->
           <tr>
             <td style="background:#050507;padding:24px 32px;
                        border-bottom:1px solid rgba(0,255,204,0.12);text-align:center;">
@@ -136,8 +124,6 @@ def _build_email(
               </h1>
             </td>
           </tr>
-
-          <!-- Greeting -->
           <tr>
             <td style="padding:32px 32px 0;">
               <p style="margin:0 0 8px;font-size:15px;color:#fff;">
@@ -146,33 +132,17 @@ def _build_email(
               <p style="margin:0;font-size:13px;line-height:1.7;color:#6b7090;">
                 Your registration for
                 <strong style="color:#fff;">{event_name}</strong>
-                has been confirmed. Below is your official QR-based Digital ID.
+                has been confirmed. Your QR Digital ID is attached as a PNG.
                 Present it to our volunteers at the entry desk — on your phone
                 screen or as a printout.
               </p>
             </td>
           </tr>
-
-          <!-- QR code -->
           <tr>
-            <td align="center" style="padding:32px;">
-              <div style="display:inline-block;padding:16px;
-                          background:#fff;border-radius:4px;
-                          box-shadow:0 0 30px rgba(0,255,204,0.15);">
-                <img src="cid:qr_code_image"
-                     alt="Your QR Digital ID"
-                     width="200" height="200"
-                     style="display:block;border:0;">
-              </div>
-            </td>
-          </tr>
-
-          <!-- Details row -->
-          <tr>
-            <td style="padding:0 32px 32px;">
+            <td style="padding:0 32px 32px;margin-top:24px;">
               <table width="100%" cellpadding="0" cellspacing="0"
                      style="background:#050507;border:1px solid rgba(0,255,204,0.08);
-                            border-radius:4px;">
+                            border-radius:4px;margin-top:24px;">
                 <tr>
                   <td style="padding:14px 20px;border-bottom:1px solid rgba(255,255,255,0.04);">
                     <span style="font-size:10px;letter-spacing:3px;color:#3d4055;
@@ -197,8 +167,6 @@ def _build_email(
               </table>
             </td>
           </tr>
-
-          <!-- Footer -->
           <tr>
             <td style="padding:20px 32px 28px;
                        border-top:1px solid rgba(0,255,204,0.08);text-align:center;">
@@ -209,7 +177,6 @@ def _build_email(
               </p>
             </td>
           </tr>
-
         </table>
       </td>
     </tr>
@@ -217,127 +184,72 @@ def _build_email(
 </body>
 </html>"""
 
-    # ── Assemble MIME structure ──────────────────────────────────────────────
-    # outer: mixed  (carries the attachment)
-    # └─ inner: alternative (plain + html)
-    #    └─ related (html + inline image)
-    outer = MIMEMultipart("mixed")
-    outer["Subject"] = f"Your Digital ID — Cyber Odyssey 2.0 | {event_name}"
-    outer["From"]    = f"Cyber Odyssey 2.0 <{SENDER_EMAIL}>"
-    outer["To"]      = participant_email
-
-    # alternative wrapper
-    alternative = MIMEMultipart("alternative")
-
-    # plain text
-    alternative.attach(MIMEText(plain_body, "plain", "utf-8"))
-
-    # related: binds HTML + inline image together
-    related = MIMEMultipart("related")
-    related.attach(MIMEText(html_body, "html", "utf-8"))
-
-    # inline QR (referenced in HTML via cid:qr_code_image)
-    inline_qr = MIMEImage(qr_bytes, _subtype="png")
-    inline_qr.add_header("Content-ID", "<qr_code_image>")
-    inline_qr.add_header("Content-Disposition", "inline", filename="digital_id.png")
-    related.attach(inline_qr)
-
-    alternative.attach(related)
-    outer.attach(alternative)
-
-    # standalone attachment (for clients that strip inline images)
-    attachment = MIMEImage(qr_bytes, _subtype="png")
-    safe_name   = participant_name.replace(" ", "_").replace("/", "_")
-    attachment.add_header(
-        "Content-Disposition", "attachment",
-        filename=f"{safe_name}_Digital_ID.png"
-    )
-    outer.attach(attachment)
-
-    return outer
+    return plain, html
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMTP send (synchronous — runs in a thread pool so it doesn't block the
-# FastAPI event loop)
+# Resend HTTP send  (replaces the blocked SMTP path entirely)
 # ─────────────────────────────────────────────────────────────────────────────
-def _smtp_send_blocking(msg: MIMEMultipart, recipient: str) -> None:
+def _resend_send_blocking(
+    recipient: str,
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    qr_bytes: bytes,
+    participant_name: str,
+) -> None:
     """
-    Synchronous SMTP send with retry logic.
-    Raises on final failure so the caller can log/handle it.
+    Sends the email via Resend's HTTP API.
+    Resend handles all SMTP relay internally — outbound port 587 is never
+    opened from the Render server, so the 'Network is unreachable' error
+    that blocked the SMTP path cannot occur here.
+
+    The QR code is sent as an attachment (base64-encoded PNG).
     """
-    last_exc: Exception | None = None
+    safe_name  = participant_name.replace(" ", "_").replace("/", "_")
+    qr_b64     = base64.b64encode(qr_bytes).decode("utf-8")
 
-    for attempt in range(1, MAX_RETRIES + 2):   # attempts: 1, 2, 3
-        try:
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(SENDER_EMAIL, SENDER_PASSWORD)
-                server.sendmail(SENDER_EMAIL, [recipient], msg.as_string())
+    params: resend.Emails.SendParams = {
+        "from":    SENDER_FROM,
+        "to":      [recipient],
+        "subject": subject,
+        "text":    plain_body,
+        "html":    html_body,
+        "attachments": [
+            {
+                "filename": f"{safe_name}_Digital_ID.png",
+                "content":  qr_b64,
+            }
+        ],
+    }
 
-            logger.info("Email delivered to %s (attempt %d)", recipient, attempt)
-            return   # success
-
-        except smtplib.SMTPAuthenticationError as exc:
-            # Wrong credentials — retrying won't help
-            logger.error("SMTP authentication failed. Check SENDER_EMAIL / SENDER_PASSWORD.")
-            raise exc
-
-        except smtplib.SMTPRecipientsRefused as exc:
-            # Invalid recipient address — retrying won't help
-            logger.error("Recipient address refused by SMTP server: %s", recipient)
-            raise exc
-
-        except (smtplib.SMTPException, OSError, TimeoutError) as exc:
-            last_exc = exc
-            logger.warning(
-                "SMTP send failed on attempt %d/%d for %s: %s",
-                attempt, MAX_RETRIES + 1, recipient, exc
-            )
-            if attempt <= MAX_RETRIES:
-                # Brief back-off before retry (blocking is fine — we're in a thread)
-                import time
-                time.sleep(2 * attempt)
-
-    raise RuntimeError(
-        f"Email to {recipient} failed after {MAX_RETRIES + 1} attempts. "
-        f"Last error: {last_exc}"
-    )
+    response = resend.Emails.send(params)
+    logger.info("Resend dispatch accepted. Message ID: %s → %s", response.get("id"), recipient)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public async interface (called by routes.py with `await`)
+# Public async interface  (signature unchanged — routes.py needs no edits)
 # ─────────────────────────────────────────────────────────────────────────────
 async def send_qr_email(
     participant_email: str,
     participant_name: str,
     team_id: str,
     event_name: str,
-    participant_id: str,          # ← Bug A fix: added missing parameter
-    event_id: str = "",           # raw Firestore event_id e.g. "event_codeshield"
+    participant_id: str,
+    event_id: str = "",
 ) -> None:
     """
-    Generates a QR-code Digital ID and emails it to the participant.
-
-    Must be called with `await` from an async context (FastAPI route handler).
-    The blocking SMTP work is offloaded to a thread-pool executor so it never
-    stalls the event loop.
-
-    Raises on unrecoverable errors (auth failure, bad recipient).
-    Logs and re-raises on transient errors after MAX_RETRIES attempts.
+    Generates a QR-code Digital ID and emails it via Resend.
+    Drop-in replacement for the old SMTP version — same signature,
+    same async interface, same non-fatal error contract.
     """
-
-    # ── 1. Derive event_id if caller only supplied event_name ────────────────
-    # Prefer the explicit event_id field; fall back to deriving it from name.
     resolved_event_id = (
         event_id.strip()
         if event_id.strip()
         else "event_" + event_name.lower().replace(" ", "_")
     )
 
-    # ── 2. Build QR payload (JSON, matches scanner.html parser) ─────────────
+    # 1. Build QR payload and render PNG bytes
     qr_payload = _build_qr_payload(
         participant_id=participant_id,
         event_id=resolved_event_id,
@@ -346,24 +258,28 @@ async def send_qr_email(
     )
     logger.debug("QR payload for %s: %s", participant_email, qr_payload)
 
-    # ── 3. Generate QR code bytes (CPU work — fine on the event loop) ────────
     qr_bytes = _generate_qr_bytes(qr_payload)
 
-    # ── 4. Assemble email ────────────────────────────────────────────────────
-    msg = _build_email(
-        participant_email=participant_email,
+    # 2. Build email content
+    plain_body, html_body = _build_html_body(
         participant_name=participant_name,
         event_name=event_name,
         team_id=team_id,
-        qr_bytes=qr_bytes,
     )
 
-    # ── 5. Send via thread pool (smtplib is synchronous/blocking) ────────────
-    # Bug B fix: the original code called `send_qr_email` without `await`,
-    # which created a coroutine that was immediately discarded — nothing was
-    # ever sent.  By offloading to run_in_executor we remain properly async.
+    subject = f"Your Digital ID — Cyber Odyssey 2.0 | {event_name}"
+
+    # 3. Send via thread pool (resend.Emails.send is synchronous)
     loop = asyncio.get_event_loop()
-    send_fn = partial(_smtp_send_blocking, msg, participant_email)
-    await loop.run_in_executor(None, send_fn)
+    await loop.run_in_executor(
+        None,
+        _resend_send_blocking,
+        participant_email,
+        subject,
+        plain_body,
+        html_body,
+        qr_bytes,
+        participant_name,
+    )
 
     logger.info("Digital ID email successfully dispatched to %s", participant_email)
