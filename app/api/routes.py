@@ -19,6 +19,7 @@ from app.models.schemas import (
 )
 from app.services.email_service import send_qr_email
 from app.services.bracket_algo import generate_perfect_bracket
+from app.core.auth_deps import require_auth, require_role
 
 router = APIRouter(tags=["Core API Routes"])
 
@@ -29,9 +30,22 @@ def get_db():
 
 # ---------------------------------------------------------
 # 1. USER AUTH & ROLE SYNC
+#    Auth required — but any authenticated user can sync
+#    their own profile. UID spoofing is blocked server-side.
 # ---------------------------------------------------------
 @router.post("/users/sync", status_code=status.HTTP_200_OK)
-async def sync_user(user_data: UserSyncSchema, db: firestore.Client = Depends(get_db)):
+async def sync_user(
+    user_data: UserSyncSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_auth),
+):
+    # Prevent a user from syncing someone else's UID
+    if caller["uid"] != user_data.uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot sync another user's profile.",
+        )
+
     user_ref = db.collection("users").document(user_data.uid)
     user_ref.set(
         {
@@ -46,7 +60,8 @@ async def sync_user(user_data: UserSyncSchema, db: firestore.Client = Depends(ge
 
 
 # ---------------------------------------------------------
-# 2. EVENT DISCOVERY & CAPACITIES
+# 2. EVENT DISCOVERY — PUBLIC
+#    Registration page needs this before the user is logged in.
 # ---------------------------------------------------------
 @router.get("/events")
 async def get_events(db: firestore.Client = Depends(get_db)):
@@ -65,17 +80,17 @@ async def get_events(db: firestore.Client = Depends(get_db)):
 
 
 # ---------------------------------------------------------
-# 3. TEAM CREATION
+# 3. TEAM CREATION — any authenticated user
 # ---------------------------------------------------------
 @router.post("/teams", response_model=TeamResponse)
 async def create_team(
-    team_data: TeamCreateSchema, db: firestore.Client = Depends(get_db)
+    team_data: TeamCreateSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_auth),
 ):
-    # Validation to prevent undefined event IDs
     if not team_data.event_id or team_data.event_id == "undefined":
         raise HTTPException(status_code=400, detail="Invalid Event ID provided.")
 
-    # Check for duplicate team names within the same event
     teams_ref = db.collection("teams")
     query = (
         teams_ref.where("event_id", "==", team_data.event_id)
@@ -101,17 +116,18 @@ async def create_team(
 
 
 # ---------------------------------------------------------
-# 4. PARTICIPANT REGISTRATION & DIGITAL ID
+# 4. PARTICIPANT REGISTRATION — any authenticated user
 # ---------------------------------------------------------
 @router.post("/participants", response_model=ParticipantResponse)
 async def register_participant(
-    data: ParticipantRegisterSchema, db: firestore.Client = Depends(get_db)
+    data: ParticipantRegisterSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_auth),
 ):
     try:
         # 1. Verify the event_id actually exists in Firestore.
-        #    This replaces a hardcoded VALID_EVENTS list — any event added to
-        #    the 'events' collection (including event_guest_lecture) is
-        #    automatically accepted here without code changes.
+        #    Any event added to the 'events' collection is automatically
+        #    accepted here — no hardcoded list, no code changes required.
         event_doc = db.collection("events").document(data.event_id).get()
         if not event_doc.exists:
             raise HTTPException(
@@ -148,27 +164,24 @@ async def register_participant(
             )
 
         # 3. Prepare Firestore payload.
-        #
-        #    FIX 1 — SECURITY: exclude "password" from the dict so it is never
-        #    written to Firestore. Storing plaintext passwords in a database is
-        #    a critical security vulnerability. The password field exists solely
-        #    to create the Firebase Auth account (step 3b below).
+        #    SECURITY: password is excluded so it is never written to Firestore.
+        #    It exists in the schema solely to create the Firebase Auth account
+        #    in step 3b — storing plaintext passwords in a database is a
+        #    critical security vulnerability.
         participant_data = data.dict(exclude={"password"})
-        participant_data["registered_at"] = datetime.now(timezone.utc)
+        participant_data["registered_at"]     = datetime.now(timezone.utc)
         participant_data["attendance_status"] = "Pending"
-        participant_data["scanned_at"] = None
-        participant_data["team_id"] = data.team_id or "INDIVIDUAL"
+        participant_data["scanned_at"]        = None
+        participant_data["team_id"]           = data.team_id or "INDIVIDUAL"
 
         # 4. Insert participant document into Firestore
-        _, doc_ref = db.collection("participants").add(participant_data)
+        _, doc_ref     = db.collection("participants").add(participant_data)
         participant_id = doc_ref.id
 
-        # 3b. FIX 2 — VOLUNTEER FLOW: If the volunteer dashboard provided a
-        #     password, create a Firebase Auth account for the participant so
-        #     they can log in and view their Digital ID.
-        #     The public registration form does NOT send a password, so this
-        #     block is skipped entirely for all public registrations — fixing
-        #     the "Field required" 422 error that was breaking registration.
+        # 3b. VOLUNTEER FLOW: If the volunteer dashboard provided a password,
+        #     create a Firebase Auth account so the participant can log in and
+        #     view their Digital ID. The public registration form does NOT send
+        #     a password, so this block is skipped for all public registrations.
         if data.password:
             try:
                 user_record = auth.create_user(
@@ -176,38 +189,31 @@ async def register_participant(
                     password=data.password,
                     display_name=data.full_name,
                 )
-                # Sync the new Auth user into the users collection
                 db.collection("users").document(user_record.uid).set(
                     {
-                        "email": data.gmail,
-                        "role": "Participant",
+                        "email":          data.gmail,
+                        "role":           "Participant",
                         "assigned_event": data.event_id,
                         "participant_id": participant_id,
-                        "created_at": datetime.now(timezone.utc),
+                        "created_at":     datetime.now(timezone.utc),
                     }
                 )
             except auth.EmailAlreadyExistsError:
-                # Auth account already exists — not fatal, Firestore doc was
-                # already written so registration is still considered a success.
+                # Auth account already exists — non-fatal, Firestore doc is
+                # already written so registration is still a success.
                 print(
                     f"[INFO] Firebase Auth account already exists for {data.gmail}. "
                     f"Skipping Auth creation."
                 )
             except Exception as e:
-                # Auth creation failure is non-fatal — the participant record
-                # is already in Firestore. Log it clearly.
+                # Auth creation failure is non-fatal — participant record is
+                # already in Firestore.
                 print(
                     f"[NON-FATAL] Firebase Auth creation failed for {data.gmail}. "
                     f"Reason: {e}"
                 )
 
         # 5. Dispatch Digital ID email with QR code.
-        #
-        #    Bug A fix: participant_id is now passed (was missing → TypeError).
-        #    Bug B fix: await is now used (was missing → coroutine discarded,
-        #               nothing was ever sent).
-        #    event_id is passed so the QR JSON carries the raw Firestore ID
-        #    (e.g. "event_guest_lecture"), consistent with scanner.html.
         event_display_name = (
             event_config.get("name")
             or data.event_id.replace("event_", "").replace("_", " ").title()
@@ -218,12 +224,10 @@ async def register_participant(
                 participant_name=data.full_name,
                 event_name=event_display_name,
                 participant_id=participant_id,
-                team_id=data.team_id or "INDIVIDUAL",
+                team_id=participant_data["team_id"],
                 event_id=data.event_id,
             )
         except Exception as e:
-            # Email failure is non-fatal — registration is already committed.
-            # Log clearly so it surfaces in Render's log stream.
             print(
                 f"[NON-FATAL] Email dispatch failed for {data.gmail}. "
                 f"participant_id={participant_id}  Reason: {e}"
@@ -231,11 +235,11 @@ async def register_participant(
 
         return {
             "participant_id": participant_id,
-            "team_id": participant_data["team_id"],
-            "event_id": data.event_id,
-            "full_name": data.full_name,
-            "status": "Registered",
-            "registered_at": participant_data["registered_at"],
+            "team_id":        participant_data["team_id"],
+            "event_id":       data.event_id,
+            "full_name":      data.full_name,
+            "status":         "Registered",
+            "registered_at":  participant_data["registered_at"],
         }
 
     except HTTPException:
@@ -245,15 +249,17 @@ async def register_participant(
 
 
 # ---------------------------------------------------------
-# 5. ATTENDANCE & QR SCANNING
+# 5. ATTENDANCE & QR SCANNING — Admin or Volunteer only
 # ---------------------------------------------------------
 @router.post("/attendance/scan")
 async def log_attendance_scan(
-    scan_data: QRScanSchema, db: firestore.Client = Depends(get_db)
+    scan_data: QRScanSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin", "Volunteer"])),
 ):
     try:
         doc_ref = db.collection("participants").document(scan_data.participant_id)
-        doc = doc_ref.get()
+        doc     = doc_ref.get()
 
         if not doc.exists:
             raise HTTPException(
@@ -278,19 +284,19 @@ async def log_attendance_scan(
         doc_ref.update(
             {
                 "attendance_status": "Present",
-                "scanned_at": scan_time,
-                "scanned_by": scan_data.scanned_by_uid,
+                "scanned_at":        scan_time,
+                "scanned_by":        scan_data.scanned_by_uid,
             }
         )
 
         # 2. Push to the immutable Global Attendance Log
         db.collection("attendance").add(
             {
-                "participant_id": scan_data.participant_id,
+                "participant_id":   scan_data.participant_id,
                 "participant_name": p_data.get("full_name", "Unknown Node"),
-                "event_id": scan_data.event_id,
-                "scanned_by_uid": scan_data.scanned_by_uid,
-                "timestamp": scan_time,
+                "event_id":         scan_data.event_id,
+                "scanned_by_uid":   scan_data.scanned_by_uid,
+                "timestamp":        scan_time,
             }
         )
 
@@ -303,7 +309,7 @@ async def log_attendance_scan(
 
 
 # ---------------------------------------------------------
-# 6. SYSTEM SYNCHRONIZATION
+# 6. SYSTEM TIME — PUBLIC
 # ---------------------------------------------------------
 @router.get("/system/time")
 async def get_server_time():
@@ -311,19 +317,19 @@ async def get_server_time():
 
 
 # ---------------------------------------------------------
-# 7. ADMIN / VOLUNTEER ROSTER FETCH
+# 7. ROSTER FETCH — Admin or Volunteer only
 # ---------------------------------------------------------
 @router.get("/admin/events/{event_id}/roster")
 async def get_event_roster(
-    event_id: str, db: firestore.Client = Depends(get_db)
+    event_id: str,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin", "Volunteer"])),
 ):
     try:
-        docs = (
-            db.collection("participants").where("event_id", "==", event_id).stream()
-        )
+        docs   = db.collection("participants").where("event_id", "==", event_id).stream()
         roster = []
         for doc in docs:
-            data = doc.to_dict()
+            data                   = doc.to_dict()
             data["participant_id"] = doc.id
             roster.append(data)
         return roster
@@ -332,69 +338,71 @@ async def get_event_roster(
 
 
 # ---------------------------------------------------------
-# 8. COMMUNICATIONS DISPATCH
+# 8. COMMUNICATIONS DISPATCH — Admin only
 # ---------------------------------------------------------
 @router.post("/admin/comms/dispatch")
 async def dispatch_communications(
-    payload: CommsPayloadSchema, db: firestore.Client = Depends(get_db)
+    payload: CommsPayloadSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin"])),
 ):
     try:
         db.collection("communications_log").add(
             {
-                "target_event": payload.target_event,
-                "subject": payload.subject,
-                "body": payload.body,
+                "target_event":  payload.target_event,
+                "subject":       payload.subject,
+                "body":          payload.body,
                 "dispatched_at": datetime.now(timezone.utc),
+                "dispatched_by": caller["uid"],
             }
         )
-        return {
-            "message": f"Comms dispatched to {payload.target_event} successfully."
-        }
+        return {"message": f"Comms dispatched to {payload.target_event} successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------
-# 9. EVALUATION (JUDGE SCORING)
+# 9. EVALUATION (JUDGE SCORING) — Admin, Volunteer, or Judge
 # ---------------------------------------------------------
 @router.post("/evaluations/submit")
 async def submit_evaluation(
-    payload: EvaluationPayloadSchema, db: firestore.Client = Depends(get_db)
+    payload: EvaluationPayloadSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin", "Volunteer", "Judge"])),
 ):
     try:
         total_score = sum(payload.scores.values())
-        eval_data = {
-            "target_id": payload.target_id,
-            "event_id": payload.event_id,
-            "scores": payload.scores,
-            "total_score": total_score,
-            "feedback": payload.feedback,
+        eval_data   = {
+            "target_id":    payload.target_id,
+            "event_id":     payload.event_id,
+            "scores":       payload.scores,
+            "total_score":  total_score,
+            "feedback":     payload.feedback,
             "submitted_at": datetime.now(timezone.utc),
+            "submitted_by": caller["uid"],
         }
         db.collection("evaluations").add(eval_data)
-        return {
-            "message": "Evaluation logged successfully.",
-            "total_score": total_score,
-        }
+        return {"message": "Evaluation logged successfully.", "total_score": total_score}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------
-# 10. BRACKET INITIALIZATION (Tournament Events)
+# 10. BRACKET INITIALIZATION — Admin only
 # ---------------------------------------------------------
 @router.post("/events/bracket/{event_id}/generate")
 async def initialize_bracket(
-    event_id: str, db: firestore.Client = Depends(get_db)
+    event_id: str,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin"])),
 ):
     try:
-        participants_ref = (
+        docs = (
             db.collection("participants")
             .where("event_id", "==", event_id)
             .where("attendance_status", "==", "Present")
+            .stream()
         )
-        docs = participants_ref.stream()
-
         competitors = [
             {"id": doc.id, "name": doc.to_dict().get("full_name", "Unknown")}
             for doc in docs
@@ -407,19 +415,14 @@ async def initialize_bracket(
             )
 
         bracket_structure = generate_perfect_bracket(competitors)
-
         db.collection("event_settings").document(f"{event_id}_bracket").set(
             {
-                "rounds": bracket_structure,
+                "rounds":       bracket_structure,
                 "generated_at": datetime.now(timezone.utc),
-                "status": "Active",
+                "status":       "Active",
             }
         )
-
-        return {
-            "message": "Bracket generated successfully.",
-            "bracket": bracket_structure,
-        }
+        return {"message": "Bracket generated successfully.", "bracket": bracket_structure}
 
     except HTTPException:
         raise
@@ -428,40 +431,33 @@ async def initialize_bracket(
 
 
 # ---------------------------------------------------------
-# 11. BRACKET ADVANCEMENT
+# 11. BRACKET ADVANCEMENT — Admin only
 # ---------------------------------------------------------
 @router.post("/events/bracket/{event_id}/update")
 async def update_bracket(
     event_id: str,
     payload: BracketUpdateSchema,
     db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin"])),
 ):
     try:
-        bracket_ref = db.collection("event_settings").document(
-            f"{event_id}_bracket"
-        )
-        doc = bracket_ref.get()
+        bracket_ref = db.collection("event_settings").document(f"{event_id}_bracket")
+        doc         = bracket_ref.get()
 
         if not doc.exists:
-            raise HTTPException(
-                status_code=404, detail="Bracket not found for this event."
-            )
+            raise HTTPException(status_code=404, detail="Bracket not found for this event.")
 
         bracket_data = doc.to_dict()
-        rounds = bracket_data.get("rounds", [])
-
-        r_idx = payload.round_index
-        m_idx = payload.match_index
+        rounds       = bracket_data.get("rounds", [])
+        r_idx        = payload.round_index
+        m_idx        = payload.match_index
 
         if r_idx >= len(rounds) - 1:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot advance from the final round.",
-            )
+            raise HTTPException(status_code=400, detail="Cannot advance from the final round.")
 
         current_match = rounds[r_idx][m_idx]
+        winner_node   = None
 
-        winner_node = None
         if current_match.get("p1") and current_match["p1"].get("id") == payload.winner_id:
             winner_node = current_match["p1"]
         elif current_match.get("p2") and current_match["p2"].get("id") == payload.winner_id:
@@ -469,11 +465,10 @@ async def update_bracket(
 
         if not winner_node:
             raise HTTPException(
-                status_code=400,
-                detail="Winner ID not found in the specified match.",
+                status_code=400, detail="Winner ID not found in the specified match."
             )
 
-        next_match_idx = m_idx // 2
+        next_match_idx   = m_idx // 2
         participant_slot = "p1" if m_idx % 2 == 0 else "p2"
         rounds[r_idx + 1][next_match_idx][participant_slot] = winner_node
         bracket_ref.update({"rounds": rounds})
@@ -487,58 +482,55 @@ async def update_bracket(
 
 
 # ---------------------------------------------------------
-# 12. AUTHORIZE VOLUNTEER
+# 12. AUTHORIZE VOLUNTEER — Admin only
 # ---------------------------------------------------------
 @router.post("/admin/volunteers")
 async def register_volunteer(
-    data: VolunteerCreateSchema, db: firestore.Client = Depends(get_db)
+    data: VolunteerCreateSchema,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin"])),
 ):
     try:
         user_record = auth.create_user(email=data.email, password=data.password)
-
         db.collection("users").document(user_record.uid).set(
             {
-                "email": data.email,
-                "role": "Volunteer",
+                "email":          data.email,
+                "role":           "Volunteer",
                 "assigned_event": data.assigned_event,
-                "created_at": datetime.now(timezone.utc),
+                "created_at":     datetime.now(timezone.utc),
             }
         )
-
         return {
             "message": f"Volunteer {data.email} authorized successfully.",
-            "status": "success",
+            "status":  "success",
         }
-
     except auth.EmailAlreadyExistsError:
         raise HTTPException(
-            status_code=400,
-            detail="This email is already authorized in the grid.",
+            status_code=400, detail="This email is already authorized in the grid."
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------
-# 13. UPDATE PARTICIPANT DATA (PATCH)
+# 13. UPDATE PARTICIPANT DATA (PATCH) — Admin or Volunteer
 # ---------------------------------------------------------
 @router.patch("/admin/participants/{participant_id}")
 async def update_participant(
     participant_id: str,
     data: ParticipantUpdateSchema,
     db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin", "Volunteer"])),
 ):
     try:
         update_data = data.dict(exclude_none=True)
-
         if not update_data:
             return {"message": "No data provided to update.", "status": "success"}
 
         doc_ref = db.collection("participants").document(participant_id)
         if not doc_ref.get().exists:
             raise HTTPException(
-                status_code=404,
-                detail="Participant node not found in the grid.",
+                status_code=404, detail="Participant node not found in the grid."
             )
 
         doc_ref.update(update_data)
@@ -551,25 +543,25 @@ async def update_participant(
 
 
 # ---------------------------------------------------------
-# 14. REMOVE PARTICIPANT NODE (DELETE)
+# 14. REMOVE PARTICIPANT NODE (DELETE) — Admin only
 # ---------------------------------------------------------
 @router.delete("/admin/participants/{participant_id}")
 async def delete_participant(
-    participant_id: str, db: firestore.Client = Depends(get_db)
+    participant_id: str,
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin"])),
 ):
     try:
         doc_ref = db.collection("participants").document(participant_id)
-        doc = doc_ref.get()
+        doc     = doc_ref.get()
 
         if not doc.exists:
             raise HTTPException(
-                status_code=404,
-                detail="Participant node not found in the grid.",
+                status_code=404, detail="Participant node not found in the grid."
             )
 
         participant_data = doc.to_dict()
-        gmail = participant_data.get("gmail")
-
+        gmail            = participant_data.get("gmail")
         doc_ref.delete()
 
         # Best-effort: remove Firebase Auth account and users doc
@@ -594,24 +586,25 @@ async def delete_participant(
 # =========================================================
 
 # ---------------------------------------------------------
-# 15. FETCH ACTIVE STAFF (ADMIN DASHBOARD)
+# 15. FETCH ACTIVE STAFF — Admin only
 # ---------------------------------------------------------
 @router.get("/admin/staff")
-async def get_active_staff(db: firestore.Client = Depends(get_db)):
+async def get_active_staff(
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin"])),
+):
     try:
-        docs = (
-            db.collection("users").where("role", "in", ["Admin", "Volunteer"]).stream()
-        )
+        docs       = db.collection("users").where("role", "in", ["Admin", "Volunteer"]).stream()
         staff_list = []
         for doc in docs:
             data = doc.to_dict()
             staff_list.append(
                 {
-                    "uid": doc.id,
-                    "email": data.get("email", "Unknown"),
-                    "role": data.get("role", "Unknown"),
+                    "uid":            doc.id,
+                    "email":          data.get("email", "Unknown"),
+                    "role":           data.get("role", "Unknown"),
                     "assigned_event": data.get("assigned_event", "Master Control"),
-                    "last_active": data.get("synced_at") or data.get("created_at"),
+                    "last_active":    data.get("synced_at") or data.get("created_at"),
                 }
             )
         return staff_list
@@ -624,10 +617,13 @@ async def get_active_staff(db: firestore.Client = Depends(get_db)):
 # =========================================================
 
 # ---------------------------------------------------------
-# 16. FETCH GLOBAL ATTENDANCE LOGS
+# 16. FETCH GLOBAL ATTENDANCE LOGS — Admin or Volunteer
 # ---------------------------------------------------------
 @router.get("/admin/attendance/logs")
-async def get_attendance_logs(db: firestore.Client = Depends(get_db)):
+async def get_attendance_logs(
+    db: firestore.Client = Depends(get_db),
+    caller: dict = Depends(require_role(["Admin", "Volunteer"])),
+):
     try:
         docs = (
             db.collection("attendance")
@@ -637,7 +633,7 @@ async def get_attendance_logs(db: firestore.Client = Depends(get_db)):
         )
         logs = []
         for doc in docs:
-            data = doc.to_dict()
+            data           = doc.to_dict()
             data["log_id"] = doc.id
             logs.append(data)
         return logs
