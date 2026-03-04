@@ -1,19 +1,25 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, Dict
 from datetime import datetime
 
-# 1. User Sync Schema (Fixes Database Error during login/sync)
+
+# ---------------------------------------------------------
+# 1. USER AUTH & ROLE SYNC
+# ---------------------------------------------------------
 class UserSyncSchema(BaseModel):
     uid: str
     email: EmailStr
     role: str
-    # Fixed: Default to empty string to prevent validation failure if null is sent
     assigned_event: Optional[str] = ""
 
-# 2. Team Creation Schema
+
+# ---------------------------------------------------------
+# 2. TEAM MANAGEMENT
+# ---------------------------------------------------------
 class TeamCreateSchema(BaseModel):
     event_id: str
     team_name: str
+
 
 class TeamResponse(BaseModel):
     team_id: str
@@ -22,19 +28,30 @@ class TeamResponse(BaseModel):
     status: str
     created_at: datetime
 
-# 3. Registration Schema (Fixes 404 & Validation Errors)
+
+# ---------------------------------------------------------
+# 3. PARTICIPANT REGISTRATION
+# ---------------------------------------------------------
 class ParticipantRegisterSchema(BaseModel):
     event_id: str
     full_name: str
     enrollment_number: str
-    # Fixed: Ensure bool type matches the 'is_external' checkbox
     is_external: bool = False
     university_name: Optional[str] = ""
     department: str
     academic_year: str
     contact_number: str
     gmail: EmailStr
-    team_id: Optional[str] = None
+    team_id: Optional[str] = None          # None → coerced to "INDIVIDUAL" in routes.py
+
+    # FIX: `password` was missing from this schema entirely.
+    # volunteer.html's "Register Node" form submits a password field so the
+    # backend can create the Firebase Auth account for the participant.
+    # Without this field, Pydantic silently strips it from the payload before
+    # routes.py ever sees it, meaning Firebase Auth creation never happens and
+    # the participant cannot log in to view their Digital ID.
+    password: str
+
 
 class ParticipantResponse(BaseModel):
     participant_id: str
@@ -44,14 +61,14 @@ class ParticipantResponse(BaseModel):
     status: str
     registered_at: datetime
 
+
 # ---------------------------------------------------------
-# NEW: PHASE 3 - VOLUNTEER CRUD UPDATE SCHEMA
+# 4. PARTICIPANT UPDATE (PATCH — Volunteer / Admin CRM)
 # ---------------------------------------------------------
 class ParticipantUpdateSchema(BaseModel):
     """
-    All fields are Optional. This allows the frontend to send a PATCH request
-    modifying only specific fields (like changing a team_id or fixing a typo)
-    without needing to resubmit the participant's entire profile.
+    All fields are Optional so the frontend can PATCH only the fields that
+    changed without resubmitting the full profile.
     """
     event_id: Optional[str] = None
     full_name: Optional[str] = None
@@ -64,32 +81,47 @@ class ParticipantUpdateSchema(BaseModel):
     gmail: Optional[EmailStr] = None
     team_id: Optional[str] = None
 
-# 4. QR & Attendance
+
+# ---------------------------------------------------------
+# 5. QR SCANNING & ATTENDANCE
+# ---------------------------------------------------------
 class QRScanSchema(BaseModel):
     event_id: str
     participant_id: str
-    scanned_by_uid: str 
+    scanned_by_uid: str
 
-# 5. Communications Dispatch
+
+# ---------------------------------------------------------
+# 6. COMMUNICATIONS DISPATCH
+# ---------------------------------------------------------
 class CommsPayloadSchema(BaseModel):
     target_event: str
     subject: str
     body: str
 
-# 6. Judge Evaluations
+
+# ---------------------------------------------------------
+# 7. JUDGE EVALUATIONS
+# ---------------------------------------------------------
 class EvaluationPayloadSchema(BaseModel):
     target_id: str
+    event_id: str
     scores: Dict[str, int]
     feedback: Optional[str] = ""
-    event_id: str
 
-# 7. Tournament Bracket Updates
+
+# ---------------------------------------------------------
+# 8. TOURNAMENT BRACKET UPDATES
+# ---------------------------------------------------------
 class BracketUpdateSchema(BaseModel):
     round_index: int
     match_index: int
     winner_id: str
 
-# 8. Volunteer Authorization Schema
+
+# ---------------------------------------------------------
+# 9. VOLUNTEER AUTHORIZATION
+# ---------------------------------------------------------
 class VolunteerCreateSchema(BaseModel):
     email: EmailStr
     password: str
