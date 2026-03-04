@@ -44,11 +44,11 @@ class ParticipantRegisterSchema(BaseModel):
     gmail: EmailStr
     team_id: Optional[str] = None
 
-    # FIX: Optional — only provided by the volunteer "Register Node" flow.
-    # The public registration form does NOT send this field.
-    # Making it required caused 422 "Field required" on every public registration.
-    # When present, routes.py uses it to create a Firebase Auth account so the
-    # participant can log in with their Digital ID.
+    # Optional — only sent by the volunteer "Register Node" flow.
+    # The public registration form (register.html) does NOT send this field;
+    # Firebase Auth is created client-side in registration.js instead.
+    # Making this required was the root cause of the 422 "Field required" error
+    # on every public registration attempt.
     password: Optional[str] = None
 
 
@@ -66,7 +66,7 @@ class ParticipantResponse(BaseModel):
 # ---------------------------------------------------------
 class ParticipantUpdateSchema(BaseModel):
     """
-    All fields Optional so the frontend can PATCH only the fields that changed
+    All fields Optional so the frontend can PATCH only changed fields
     without resubmitting the full profile.
     """
     event_id: Optional[str] = None
