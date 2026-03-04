@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict
 from datetime import datetime
 
@@ -42,15 +42,14 @@ class ParticipantRegisterSchema(BaseModel):
     academic_year: str
     contact_number: str
     gmail: EmailStr
-    team_id: Optional[str] = None          # None → coerced to "INDIVIDUAL" in routes.py
+    team_id: Optional[str] = None
 
-    # FIX: `password` was missing from this schema entirely.
-    # volunteer.html's "Register Node" form submits a password field so the
-    # backend can create the Firebase Auth account for the participant.
-    # Without this field, Pydantic silently strips it from the payload before
-    # routes.py ever sees it, meaning Firebase Auth creation never happens and
-    # the participant cannot log in to view their Digital ID.
-    password: str
+    # FIX: Optional — only provided by the volunteer "Register Node" flow.
+    # The public registration form does NOT send this field.
+    # Making it required caused 422 "Field required" on every public registration.
+    # When present, routes.py uses it to create a Firebase Auth account so the
+    # participant can log in with their Digital ID.
+    password: Optional[str] = None
 
 
 class ParticipantResponse(BaseModel):
@@ -67,8 +66,8 @@ class ParticipantResponse(BaseModel):
 # ---------------------------------------------------------
 class ParticipantUpdateSchema(BaseModel):
     """
-    All fields are Optional so the frontend can PATCH only the fields that
-    changed without resubmitting the full profile.
+    All fields Optional so the frontend can PATCH only the fields that changed
+    without resubmitting the full profile.
     """
     event_id: Optional[str] = None
     full_name: Optional[str] = None
