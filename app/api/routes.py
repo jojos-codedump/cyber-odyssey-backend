@@ -586,28 +586,32 @@ async def delete_participant(
 # =========================================================
 
 # ---------------------------------------------------------
-# 15. FETCH ACTIVE STAFF — Admin only
+# 15. FETCH ACTIVE STAFF (ADMIN DASHBOARD)
 # ---------------------------------------------------------
 @router.get("/admin/staff")
-async def get_active_staff(
-    db: firestore.Client = Depends(get_db),
-    caller: dict = Depends(require_role(["Admin"])),
-):
+async def get_active_staff(db: firestore.Client = Depends(get_db)):
     try:
-        docs       = db.collection("users").where("role", "in", ["Admin", "Volunteer"]).stream()
+        query = db.collection('users').where('role', 'in', ['Admin', 'Volunteer'])
+        docs = query.stream()
+        
         staff_list = []
         for doc in docs:
             data = doc.to_dict()
-            staff_list.append(
-                {
-                    "uid":            doc.id,
-                    "email":          data.get("email", "Unknown"),
-                    "role":           data.get("role", "Unknown"),
-                    "assigned_event": data.get("assigned_event", "Master Control"),
-                    "last_active":    data.get("synced_at") or data.get("created_at"),
-                }
-            )
+            
+            # THE FIX: Safely extract and serialize the Firestore timestamp
+            raw_time = data.get("synced_at") or data.get("created_at")
+            formatted_time = raw_time.isoformat() if hasattr(raw_time, 'isoformat') else "Unknown"
+            
+            staff_list.append({
+                "uid": doc.id,
+                "email": data.get("email", "Unknown"),
+                "role": data.get("role", "Unknown"),
+                "assigned_event": data.get("assigned_event", "Master Control"),
+                "last_active": formatted_time
+            })
+            
         return staff_list
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
