@@ -13,10 +13,10 @@ pydantic-settings==2.2.1
 qrcode[pil]==7.4.2
 Pillow
 
-# Email — HTTP-based API (replaces SMTP which is blocked on Render free tier)
-# Render blocks outbound connections on port 587, causing "Network is unreachable".
-# Resend uses HTTPS (port 443) which is always open.
-resend==2.0.0
+# Email — SendGrid HTTP API
+# Render blocks outbound SMTP (port 587). SendGrid uses HTTPS (port 443).
+# Free tier: 100 emails/day. No custom domain needed — just Single Sender Verification.
+sendgrid==6.11.0
 
 # Input validation
 email-validator==2.1.1
