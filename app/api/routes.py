@@ -108,7 +108,7 @@ async def register_participant(
     data: ParticipantRegisterSchema, db: firestore.Client = Depends(get_db)
 ):
     try:
-        # 1. Verify the event_id actually exists in Firestore
+        # 1. Verify the event_id actually exists in Firestore.
         #    This replaces a hardcoded VALID_EVENTS list — any event added to
         #    the 'events' collection (including event_guest_lecture) is
         #    automatically accepted here without code changes.
@@ -128,15 +128,18 @@ async def register_participant(
                 detail=f"Registrations for '{event_config.get('name', data.event_id)}' are currently closed.",
             )
 
-        # 1c. Enforce individual-only events (max_team_size == 1)
-        #     If a team_id was passed for a solo event, strip it out.
+        # 1c. Enforce individual-only events (max_team_size == 1).
+        #     Strip any team_id sent for a solo event.
         max_team_size = int(event_config.get("max_team_size", 1))
         if max_team_size == 1 and data.team_id and data.team_id != "INDIVIDUAL":
             data.team_id = "INDIVIDUAL"
 
         # 2. Check if email is already registered globally
         existing_query = (
-            db.collection("participants").where("gmail", "==", data.gmail).limit(1).stream()
+            db.collection("participants")
+            .where("gmail", "==", data.gmail)
+            .limit(1)
+            .stream()
         )
         if len(list(existing_query)) > 0:
             raise HTTPException(
@@ -144,28 +147,70 @@ async def register_participant(
                 detail="This email is already registered in the system.",
             )
 
-        # 3. Prepare payload
-        participant_data = data.dict()
+        # 3. Prepare Firestore payload.
+        #
+        #    FIX 1 — SECURITY: exclude "password" from the dict so it is never
+        #    written to Firestore. Storing plaintext passwords in a database is
+        #    a critical security vulnerability. The password field exists solely
+        #    to create the Firebase Auth account (step 3b below).
+        participant_data = data.dict(exclude={"password"})
         participant_data["registered_at"] = datetime.now(timezone.utc)
         participant_data["attendance_status"] = "Pending"
         participant_data["scanned_at"] = None
+        participant_data["team_id"] = data.team_id or "INDIVIDUAL"
 
-        # 4. Insert into database
+        # 4. Insert participant document into Firestore
         _, doc_ref = db.collection("participants").add(participant_data)
         participant_id = doc_ref.id
 
-        # 5. Dispatch Digital ID email with QR code
+        # 3b. FIX 2 — VOLUNTEER FLOW: If the volunteer dashboard provided a
+        #     password, create a Firebase Auth account for the participant so
+        #     they can log in and view their Digital ID.
+        #     The public registration form does NOT send a password, so this
+        #     block is skipped entirely for all public registrations — fixing
+        #     the "Field required" 422 error that was breaking registration.
+        if data.password:
+            try:
+                user_record = auth.create_user(
+                    email=data.gmail,
+                    password=data.password,
+                    display_name=data.full_name,
+                )
+                # Sync the new Auth user into the users collection
+                db.collection("users").document(user_record.uid).set(
+                    {
+                        "email": data.gmail,
+                        "role": "Participant",
+                        "assigned_event": data.event_id,
+                        "participant_id": participant_id,
+                        "created_at": datetime.now(timezone.utc),
+                    }
+                )
+            except auth.EmailAlreadyExistsError:
+                # Auth account already exists — not fatal, Firestore doc was
+                # already written so registration is still considered a success.
+                print(
+                    f"[INFO] Firebase Auth account already exists for {data.gmail}. "
+                    f"Skipping Auth creation."
+                )
+            except Exception as e:
+                # Auth creation failure is non-fatal — the participant record
+                # is already in Firestore. Log it clearly.
+                print(
+                    f"[NON-FATAL] Firebase Auth creation failed for {data.gmail}. "
+                    f"Reason: {e}"
+                )
+
+        # 5. Dispatch Digital ID email with QR code.
         #
-        #    BUG FIXES applied here:
-        #    ─ Bug A: `participant_id` is now passed (was missing → TypeError)
-        #    ─ Bug B: `await` is now used (was missing → coroutine discarded,
-        #             nothing ever sent)
-        #    ─ `event_id` is passed so the QR JSON payload carries the raw
-        #      Firestore ID (e.g. "event_guest_lecture") rather than a
-        #      re-derived string, keeping it consistent with scanner.html.
+        #    Bug A fix: participant_id is now passed (was missing → TypeError).
+        #    Bug B fix: await is now used (was missing → coroutine discarded,
+        #               nothing was ever sent).
+        #    event_id is passed so the QR JSON carries the raw Firestore ID
+        #    (e.g. "event_guest_lecture"), consistent with scanner.html.
         event_display_name = (
-            event_config.get("name")                                         # prefer Firestore name field
-            or data.event_id.replace("event_", "").replace("_", " ").title()  # fallback
+            event_config.get("name")
+            or data.event_id.replace("event_", "").replace("_", " ").title()
         )
         try:
             await send_qr_email(
@@ -177,8 +222,8 @@ async def register_participant(
                 event_id=data.event_id,
             )
         except Exception as e:
-            # Email failure is non-fatal — registration is already committed to
-            # Firestore.  Log it clearly so it surfaces in Render's log stream.
+            # Email failure is non-fatal — registration is already committed.
+            # Log clearly so it surfaces in Render's log stream.
             print(
                 f"[NON-FATAL] Email dispatch failed for {data.gmail}. "
                 f"participant_id={participant_id}  Reason: {e}"
@@ -186,7 +231,7 @@ async def register_participant(
 
         return {
             "participant_id": participant_id,
-            "team_id": data.team_id,
+            "team_id": participant_data["team_id"],
             "event_id": data.event_id,
             "full_name": data.full_name,
             "status": "Registered",
